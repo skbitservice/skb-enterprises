@@ -1,0 +1,156 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // Global Safety Net - Default Deny Catch-All
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // --- REUSABLE SECURITY PRIMITIVES ---
+
+    // Validates that document IDs contain only valid characters and are reasonably sized (Denial of Wallet Protection)
+    function isValidId(id) { 
+      return id is string && id.size() > 0 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$'); 
+    }
+
+    // Helper shortcuts
+    function incoming() { return request.resource.data; }
+    function existing() { return resource.data; }
+    function isSignedIn() { return request.auth != null; }
+    function isAdmin() {
+      return isSignedIn() && 
+             exists(/databases/$(database)/documents/users/$(request.auth.uid)) && 
+             get(/databases/$(database)/documents/users/$(request.auth.uid)).data.isAdmin == true;
+    }
+
+    // --- ENTITY SCHEMA VALIDATORS (Anti-Update-Gaps) ---
+
+    // Ensures the integrity of User Profile documents
+    function isValidUser(data) {
+      return data.keys().hasAll(['id', 'name', 'email', 'phone', 'createdAt'])
+        && data.id is string
+        && data.name is string && data.name.size() > 0 && data.name.size() <= 200
+        && data.email is string && data.email.size() > 0 && data.email.size() <= 254
+        && data.phone is string && data.phone.size() >= 8 && data.phone.size() <= 20
+        && (!('address' in data) || (data.address is string && data.address.size() <= 500))
+        && (!('isAdmin' in data) || (data.isAdmin is bool))
+        && data.createdAt is string;
+    }
+
+    // Ensures structural & type-safety check for laptop repair bookings
+    function isValidBooking(data) {
+      return data.keys().hasAll(['id', 'userId', 'brand', 'model', 'issues', 'quoteAmount', 'status', 'scheduledDate', 'serviceType', 'paymentStatus', 'createdAt'])
+        && data.userId == request.auth.uid
+        && data.id is string && data.id.size() > 0 && data.id.size() <= 128
+        && data.brand is string && data.brand.size() > 0 && data.brand.size() <= 100
+        && data.model is string && data.model.size() > 0 && data.model.size() <= 100
+        && (!('serialNumber' in data) || (data.serialNumber is string && data.serialNumber.size() <= 100))
+        && data.issues is list && data.issues.size() > 0 && data.issues.size() <= 20
+        && (!('additionalNotes' in data) || (data.additionalNotes is string && data.additionalNotes.size() <= 2000))
+        && data.quoteAmount is number && data.quoteAmount >= 0
+        && data.status in ['pending', 'received', 'diagnosing', 'repairing', 'ready', 'delivered']
+        && data.scheduledDate is string && data.scheduledDate.size() <= 50
+        && data.serviceType in ['home_pickup', 'store_visit']
+        && data.paymentStatus in ['pending', 'paid']
+        && data.createdAt is string;
+    }
+
+    // Validation for physical spare parts transactions
+    function isValidPartPurchase(data) {
+      return data.keys().hasAll(['id', 'userId', 'partId', 'partName', 'price', 'quantity', 'totalAmount', 'status', 'shippingAddress', 'createdAt'])
+        && data.userId == request.auth.uid
+        && data.id is string && data.id.size() > 0 && data.id.size() <= 128
+        && data.partId is string && data.partId.size() > 0 && data.partId.size() <= 128
+        && data.partName is string && data.partName.size() > 0 && data.partName.size() <= 250
+        && data.price is number && data.price >= 0
+        && data.quantity is number && data.quantity > 0 && data.quantity <= 100
+        && data.totalAmount is number && data.totalAmount >= 0
+        && data.status in ['processing', 'shipped', 'delivered']
+        && data.shippingAddress is string && data.shippingAddress.size() > 0 && data.shippingAddress.size() <= 500
+        && data.createdAt is string;
+    }
+
+    // Validation for spare parts catalog entries
+    function isValidPart(data) {
+      return data.keys().hasAll(['id', 'name', 'type', 'brand', 'compatibleModels', 'price', 'stock', 'description', 'image'])
+        && data.id is string && data.id.size() > 0
+        && data.name is string && data.name.size() > 0
+        && data.type in ['adapter', 'battery', 'motherboard', 'screen', 'ram', 'ssd']
+        && data.brand is string && data.brand.size() > 0
+        && data.compatibleModels is list
+        && data.price is number && data.price >= 0
+        && data.stock is number && data.stock >= 0
+        && data.description is string
+        && data.image is string;
+    }
+
+    // --- COLLECTION RULE MATCHERS ---
+
+    // 1. User Profiles Collection
+    match /users/{userId} {
+      allow list: if isAdmin();
+      allow get: if isSignedIn() && (request.auth.uid == userId || isAdmin());
+      allow create, update: if isSignedIn() && (
+        (request.auth.uid == userId && incoming().id == userId && isValidUser(incoming())) || 
+        isAdmin()
+      );
+      allow delete: if false; // Profiles are permanent for historical ledger tracking
+    }
+
+    // 2. Repair Bookings Collection (Highly Constrained State Progressions)
+    match /bookings/{bookingId} {
+      // Secure Queries: Evaluates resource.data directly to force secure where clauses
+      allow list: if isSignedIn() && (resource.data.userId == request.auth.uid || isAdmin());
+      allow get: if isSignedIn() && (resource.data.userId == request.auth.uid || isAdmin());
+      
+      allow create: if isSignedIn() && (
+        (incoming().userId == request.auth.uid && isValidBooking(incoming()) && isValidId(bookingId)) || 
+        isAdmin()
+      );
+      
+      allow update: if isSignedIn() && (
+        isAdmin() ||
+        (
+          existing().userId == request.auth.uid
+          && incoming().userId == request.auth.uid
+          && isValidBooking(incoming())
+          && (
+            // Action 1: Customer can adjust optional metadata like serial numbers or notes while active
+            (incoming().diff(existing()).affectedKeys().hasOnly(['serialNumber', 'additionalNotes'])) ||
+            // Action 2: Progression simulators and checkout state updates
+            (incoming().diff(existing()).affectedKeys().hasOnly(['status', 'paymentStatus', 'quoteAmount']))
+          )
+          // Terminal state lock: Deliberate block on historic, delivered orders
+          && existing().status != 'delivered'
+        )
+      );
+
+      allow delete: if isSignedIn() && (
+        isAdmin() ||
+        (existing().userId == request.auth.uid && existing().status == 'pending')
+      );
+    }
+
+    // 3. Parts Purchase Depot Orders
+    match /purchases/{purchaseId} {
+      allow list: if isSignedIn() && (resource.data.userId == request.auth.uid || isAdmin());
+      allow get: if isSignedIn() && (resource.data.userId == request.auth.uid || isAdmin());
+      
+      allow create: if isSignedIn() && (
+        (incoming().userId == request.auth.uid && isValidPartPurchase(incoming()) && isValidId(purchaseId)) || 
+        isAdmin()
+      );
+      allow update: if isSignedIn() && isAdmin(); // Purchase agreements are editable only by admin
+      allow delete: if isSignedIn() && isAdmin();
+    }
+
+    // 4. Products collection
+    match /products/{productId} {
+      allow read: if true; // Everyone can view spare parts in the catalog
+      allow create, update: if isSignedIn() && (isAdmin() || isValidPart(incoming()));
+      allow delete: if isSignedIn() && isAdmin();
+    }
+
+  }
+}

@@ -1,0 +1,6 @@
+{
+  "name": "SKB Enterprises",
+  "description": "Premium laptop repair service and authentic spare parts shop based in Nehru Place, New Delhi. Get instant repair quotes, book online, and manage repair history.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
